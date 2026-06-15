@@ -1,0 +1,11 @@
+# Build / test artifacts
+*.test
+*.out
+/coverage.*
+
+# Editor / OS / agent
+.DS_Store
+.vscode/launch.json
+.idea/
+.claude/launch.json
+.claude/settings.local.json
