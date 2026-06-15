@@ -19,31 +19,47 @@ import (
 	"time"
 )
 
+// defaultMaxBody bounds a response body to guard against an unbounded payload.
+const defaultMaxBody = 64 << 20
+
 // Client talks to an omni-metrics server. It is safe for concurrent use.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+	maxBody    int64
+
+	timeout    time.Duration
+	hasTimeout bool
 }
 
-// Option configures a Client.
+// Option configures a Client. Options are independent of order.
 type Option func(*Client)
 
 // WithHTTPClient sets the underlying http.Client (e.g. for custom transports,
-// TLS, or proxies). A nil client is ignored.
+// TLS, or proxies). The supplied client is shallow-copied, so the client library
+// never mutates a value the caller may use elsewhere. A nil client is ignored.
 func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) {
 		if h != nil {
-			c.httpClient = h
+			cp := *h
+			c.httpClient = &cp
 		}
 	}
 }
 
-// WithTimeout sets the per-request timeout on the default http.Client.
+// WithTimeout sets the per-request timeout. It is applied to the client the
+// library owns after all options run, so it is independent of option order and
+// never mutates a client passed via WithHTTPClient.
 func WithTimeout(d time.Duration) Option {
-	return func(c *Client) { c.httpClient.Timeout = d }
+	return func(c *Client) {
+		c.timeout = d
+		c.hasTimeout = true
+	}
 }
 
 // New creates a Client for the server at baseURL (e.g. "http://localhost:9090").
+// Any query string or fragment on baseURL is dropped; a path is kept (useful
+// behind a reverse proxy).
 func New(baseURL string, opts ...Option) (*Client, error) {
 	if baseURL == "" {
 		return nil, fmt.Errorf("omni: baseURL is required")
@@ -52,15 +68,27 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("omni: invalid baseURL: %w", err)
 	}
-	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("omni: baseURL must include a scheme and host, got %q", baseURL)
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("omni: baseURL scheme must be http or https, got %q", baseURL)
 	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("omni: baseURL must include a host, got %q", baseURL)
+	}
+	// Normalize: drop any query/fragment so request URLs (built by concatenation)
+	// cannot be corrupted; keep scheme, userinfo, host, and path.
+	u.RawQuery = ""
+	u.Fragment = ""
+
 	c := &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
+		baseURL:    strings.TrimRight(u.String(), "/"),
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		maxBody:    defaultMaxBody,
 	}
 	for _, o := range opts {
 		o(c)
+	}
+	if c.hasTimeout {
+		c.httpClient.Timeout = c.timeout
 	}
 	return c, nil
 }
@@ -107,13 +135,24 @@ func (c *Client) get(ctx context.Context, path string, params url.Values, out in
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	// Read one byte past the limit so an over-large body is detectable rather
+	// than silently truncated into a confusing decode error.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBody+1))
 	if err != nil {
 		return err
+	}
+	if int64(len(body)) > c.maxBody {
+		return &APIError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("response exceeds %d byte limit", c.maxBody)}
 	}
 
 	var env apiResponse
 	if err := json.Unmarshal(body, &env); err != nil {
+		// A non-2xx response whose body is not the envelope (a proxy/gateway HTML
+		// 502, a plain-text 401, an empty 503, ...) still surfaces as a typed
+		// *APIError carrying the status, per the documented contract.
+		if resp.StatusCode/100 != 2 {
+			return &APIError{StatusCode: resp.StatusCode, Message: statusMessage(resp.StatusCode, body)}
+		}
 		return fmt.Errorf("omni: decoding response (HTTP %d): %w", resp.StatusCode, err)
 	}
 	if env.Status != "success" {
@@ -128,6 +167,22 @@ func (c *Client) get(ctx context.Context, path string, params url.Values, out in
 }
 
 // formatTime renders a time as fractional Unix seconds, the form the API parses.
+// Full precision (no artificial millisecond cap); float64 still bounds resolution
+// to roughly microseconds at current epoch magnitudes.
 func formatTime(t time.Time) string {
-	return strconv.FormatFloat(float64(t.UnixNano())/1e9, 'f', 3, 64)
+	return strconv.FormatFloat(float64(t.UnixNano())/1e9, 'f', -1, 64)
+}
+
+// statusMessage builds an APIError message for a non-envelope error response,
+// preferring a trimmed body snippet and falling back to the HTTP status text.
+func statusMessage(status int, body []byte) string {
+	s := strings.TrimSpace(string(body))
+	if s == "" {
+		return http.StatusText(status)
+	}
+	const max = 200
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
 }

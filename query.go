@@ -23,10 +23,17 @@ func (c *Client) Query(ctx context.Context, expr string, ts time.Time) (*QueryRe
 	return parseQueryData(&qd)
 }
 
-// QueryRange evaluates expr at each step over [start, end]. step must be positive.
+// QueryRange evaluates expr at each step over [start, end]. start and end are
+// required (a range query needs a real window) and step must be positive.
 func (c *Client) QueryRange(ctx context.Context, expr string, start, end time.Time, step time.Duration) (*QueryResult, error) {
 	if step <= 0 {
 		return nil, fmt.Errorf("omni: step must be positive")
+	}
+	if start.IsZero() || end.IsZero() {
+		return nil, fmt.Errorf("omni: start and end are required")
+	}
+	if end.Before(start) {
+		return nil, fmt.Errorf("omni: end must not be before start")
 	}
 	params := url.Values{
 		"query": {expr},
