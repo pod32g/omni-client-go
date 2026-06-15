@@ -2,9 +2,10 @@
 // metrics server. It wraps the /api/v1 query and metadata endpoints with typed
 // results and errors.
 //
-// omni-metrics is pull-based: this client reads from a running server; it does
-// not push samples. Create a client with New and call Query, QueryRange, Series,
-// LabelNames, LabelValues, or Targets.
+// Create a client with New and call Query, QueryRange, Series, LabelNames,
+// LabelValues, or Targets to read. To write, use Push (POST /api/v1/push) — for a
+// process that has no HTTP server to be scraped — optionally building the payload
+// from a Registry.
 package omni
 
 import (
@@ -27,6 +28,7 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	maxBody    int64
+	pushToken  string
 
 	timeout    time.Duration
 	hasTimeout bool
@@ -55,6 +57,13 @@ func WithTimeout(d time.Duration) Option {
 		c.timeout = d
 		c.hasTimeout = true
 	}
+}
+
+// WithPushAuth sets a bearer token sent on push writes (POST /api/v1/push) as
+// "Authorization: Bearer <token>". Read requests are unaffected. An empty token
+// is ignored.
+func WithPushAuth(token string) Option {
+	return func(c *Client) { c.pushToken = token }
 }
 
 // New creates a Client for the server at baseURL (e.g. "http://localhost:9090").
@@ -128,7 +137,12 @@ func (c *Client) get(ctx context.Context, path string, params url.Values, out in
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	return c.do(req, out)
+}
 
+// do sends req, enforces the body limit, validates the {status} envelope, and
+// unmarshals data into out (which may be nil). Shared by get and post.
+func (c *Client) do(req *http.Request, out interface{}) error {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err

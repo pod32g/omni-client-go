@@ -33,6 +33,34 @@ func ExampleClient_Query() {
 	// up{job="node"} = 0
 }
 
+func ExampleClient_Push() {
+	// A real program points New at its server, e.g.
+	//   c, _ := omni.New("http://localhost:9090", omni.WithPushAuth("token"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"status":"success","data":{"samplesAppended":2,"seriesTouched":2}}`)
+	}))
+	defer srv.Close()
+
+	c, _ := omni.New(srv.URL)
+
+	// Build the payload from a small in-process registry.
+	reg := omni.NewRegistry()
+	reg.Add("records_processed_total", nil, 1500)
+	reg.Set("queue_depth", omni.Labels{"queue": "high"}, 12)
+
+	res, err := c.Push(context.Background(), &omni.PushRequest{
+		Job:      "batch-importer",
+		Instance: "worker-7",
+		Series:   reg.Series(),
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("appended %d samples across %d series\n", res.SamplesAppended, res.SeriesTouched)
+	// Output:
+	// appended 2 samples across 2 series
+}
+
 func ExampleClient_Targets() {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"status":"success","data":[`+

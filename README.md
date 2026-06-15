@@ -7,8 +7,9 @@ A small, dependency-free Go client for the [omni-metrics](https://github.com/pod
 HTTP API — a Prometheus-shaped metrics server. It wraps the `/api/v1` query and
 metadata endpoints with typed results and errors.
 
-> omni-metrics is **pull-based**: this client *reads from* a running server (runs
-> queries, lists targets/labels). It does not push samples.
+> This client *reads from* a running server (runs queries, lists targets/labels)
+> **and** can *write to* it via push (`Push`) — for a process that has no HTTP
+> server to be scraped.
 
 ## Install
 
@@ -72,10 +73,35 @@ func main() {
 | `LabelNames(ctx)` | `/api/v1/labels` | `[]string` |
 | `LabelValues(ctx, name)` | `/api/v1/label/{name}/values` | `[]string` |
 | `Targets(ctx)` | `/api/v1/targets` | `[]Target` |
+| `Push(ctx, *PushRequest)` | `/api/v1/push` | `*PushResult` |
 
 `QueryResult.Type` is one of `ResultVector`, `ResultMatrix`, or `ResultScalar`;
 the matching field (`Vector`, `Matrix`, or `Scalar`) is populated. Sample values
 are `float64` (including `+Inf`/`-Inf`/`NaN`); timestamps are `time.Time`.
+
+### Writing (push)
+
+A process with no HTTP server to scrape can push samples instead. Each push
+**appends** (building a time series, so `rate()` works on pushed counters). Build
+the payload directly, or from a small in-process `Registry`:
+
+```go
+c, _ := omni.New("http://localhost:9090", omni.WithPushAuth("token")) // token optional
+
+reg := omni.NewRegistry()
+reg.Add("records_processed_total", nil, 1500)               // counter
+reg.Set("queue_depth", omni.Labels{"queue": "high"}, 12)    // gauge
+
+res, err := c.Push(ctx, &omni.PushRequest{
+	Job:      "batch-importer",
+	Instance: "worker-7", // optional; the server defaults it to your remote host
+	Series:   reg.Series(),
+})
+```
+
+Per series, set exactly one of `Value` (a sample at receive time) or `Samples`
+(explicit `(time, value)` pairs). The server injects `job`/`instance`; a client
+cannot override `__name__`/`job`/`instance`.
 
 ### Options
 
@@ -83,6 +109,7 @@ are `float64` (including `+Inf`/`-Inf`/`NaN`); timestamps are `time.Time`.
 c, _ := omni.New("http://localhost:9090",
 	omni.WithTimeout(5*time.Second),
 	omni.WithHTTPClient(myHTTPClient), // custom transport / TLS / proxy
+	omni.WithPushAuth("token"),        // bearer token for Push writes
 )
 ```
 
